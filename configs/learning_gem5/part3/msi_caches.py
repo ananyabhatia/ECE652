@@ -46,7 +46,7 @@ from m5.util import (
 
 class MyCacheSystem(RubySystem):
     def __init__(self):
-        if not "RUBY_PROTOCOL_MSI" in buildEnv:
+        if not "RUBY_PROTOCOL_MSI_LL" in buildEnv:
             fatal("This system assumes MSI from learning gem5!")
 
         super().__init__()
@@ -111,7 +111,7 @@ class MyCacheSystem(RubySystem):
             self.sequencers[i].connectCpuPorts(cpu)
 
 
-class L1Cache(MSI_L1Cache_Controller):
+class L1Cache(MSI_LL_L1Cache_Controller):
 
     _version = 0
 
@@ -177,7 +177,7 @@ class L1Cache(MSI_L1Cache_Controller):
         self.responseFromDirOrSibling.in_port = ruby_system.network.out_port
 
 
-class DirController(MSI_Directory_Controller):
+class DirController(MSI_LL_Directory_Controller):
 
     _version = 0
 
