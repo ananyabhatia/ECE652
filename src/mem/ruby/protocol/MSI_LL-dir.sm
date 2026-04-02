@@ -59,20 +59,27 @@ machine(MachineType:Directory, "Directory protocol")
       // default value set here.
       Cycles toMemLatency := 1;
 
-    // Forwarding requests from the directory *to* the caches.
-    MessageBuffer *forwardToCache, network="To", virtual_network="1",
-          vnet_type="forward";
-    // Response from the directory *to* the cache.
-    MessageBuffer *responseToCache, network="To", virtual_network="2",
-          vnet_type="response";
 
+    // buffers that hold the messages (virtual networks)
     // Requests *from* the cache to the directory
     MessageBuffer *requestFromCache, network="From", virtual_network="0",
           vnet_type="request";
 
+    // Forwarding requests from the directory *to* the caches.
+    MessageBuffer *forwardToCache, network="To", virtual_network="1",
+          vnet_type="forward";
+
+    // Response from the directory *to* the cache.
+    MessageBuffer *responseToCache, network="To", virtual_network="2",
+          vnet_type="response";
+
     // Responses *from* the cache to the directory
     MessageBuffer *responseFromCache, network="From", virtual_network="2",
           vnet_type="response";
+
+    // Completion from the cache to the directory
+    MessageBuffer *completionFromCache, network="From", virtual_network="3",
+          vnet_type="completion";
 
     // Special buffer for memory requests. Kind of like the mandatory queue
     MessageBuffer *requestToMemory;
@@ -95,6 +102,7 @@ machine(MachineType:Directory, "Directory protocol")
 
         // Transient states
         S_D, AccessPermission:Busy,      desc="Moving to S, but need data";
+        SS_ED, AccessPermission:Busy,    desc="Waiting for PutSComplete, stalling all operations";
 
         // Waiting for data from memory
         S_m, AccessPermission:Read_Write, desc="In S waiting for mem";
@@ -111,10 +119,12 @@ machine(MachineType:Directory, "Directory protocol")
         GetM,         desc="Request for read-write data from cache";
 
         // Writeback requests from the cache
-        PutSNotLast,  desc="PutS and the block has other sharers";
-        PutSLast,     desc="PutS and the block has no other sharers";
-        PutMOwner,    desc="Dirty data writeback from the owner";
-        PutMNonOwner, desc="Dirty data writeback from non-owner";
+        PutSNotHead,            desc="PutS and the block is not the head of the LL";
+        PutSHead,               desc="PutS and the block is the head of the LL";
+        PutMOwner,           desc="Dirty data writeback from the owner";
+        PutMNonOwner,        desc="Dirty data writeback from non-owner";
+        PutSCompleteNotLast,    desc="PutSComplete and we have a new head";
+        PutSCompleteLast,       desc="PutSComplete and we don't have a new head (removed last sharer and should go to I)";
 
         // Cache responses
         Data,         desc="Response to fwd request with data";
@@ -128,8 +138,9 @@ machine(MachineType:Directory, "Directory protocol")
     // copy the structure into the message we send as a response.
     structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
         State DirState,         desc="Directory state";
-        NetDest Sharers,        desc="Sharers for this block";
-        NetDest Owner,          desc="Owner of this block";
+        // NetDest Sharers,        desc="Sharers for this block";
+        // NetDest Owner,          desc="Owner of this block";
+        MachineID Head,         desc="Linked list of sharers";
     }
 
     Tick clockEdge();
@@ -254,20 +265,38 @@ machine(MachineType:Directory, "Directory protocol")
                 } else if (in_msg.Type == CoherenceRequestType:PutS) {
                     assert(is_valid(entry));
                     // If there is only a single sharer (i.e., the requestor)
-                    if (entry.Sharers.count() == 1) {
-                        assert(entry.Sharers.isElement(in_msg.Requestor));
-                        trigger(Event:PutSLast, in_msg.addr);
+                    if (entry.Head == in_msg.Requestor) {
+                        trigger(Event:PutSHead, in_msg.addr);
                     } else {
-                        trigger(Event:PutSNotLast, in_msg.addr);
+                        trigger(Event:PutSNotHead, in_msg.addr);
                     }
                 } else if (in_msg.Type == CoherenceRequestType:PutM) {
                     assert(is_valid(entry));
-                    if (entry.Owner.isElement(in_msg.Requestor)) {
+                    if (entry.Head == in_msg.Requestor) {
                         trigger(Event:PutMOwner, in_msg.addr);
                     } else {
                         trigger(Event:PutMNonOwner, in_msg.addr);
                     }
                 } else {
+                    error("Unexpected message type.");
+                }
+            }
+        }
+    }
+
+    in_port(complete_in, ResponseMsg, completionFromCache) {
+        if (complete_in.isReady(clockEdge())) {
+            peek(complete_in, ResponseMsg) {
+                Entry entry := getDirectoryEntry(in_msg.addr);
+                if (in_msg.Type == CoherenceResponseType:PutSCompleteDir) {
+                    if (in_msg.Next == NULL) {
+                        trigger(Event:PutSCompleteLast, in_msg.addr);
+                    }
+                    else {
+                        trigger(Event:PutSCompleteNotLast, in_msg.addr);
+                    }
+                }
+                else {
                     error("Unexpected message type.");
                 }
             }
@@ -328,109 +357,150 @@ machine(MachineType:Directory, "Directory protocol")
 
     // Sharer/owner actions
 
-    action(addReqToSharers, "aS", desc="Add requestor to sharer list") {
+    action(setHeadtoReq, "hR", desc="Used in getM cases to set requestor as the head of the list") {
         peek(request_in, RequestMsg) {
-            getDirectoryEntry(address).Sharers.add(in_msg.Requestor);
+            getDirectoryEntry(address).Head := in_msg.Requestor;
         }
     }
 
-    action(setOwner, "sO", desc="Set the owner") {
-        peek(request_in, RequestMsg) {
-            getDirectoryEntry(address).Owner.add(in_msg.Requestor);
+    action(setHeadtoNull, "hNULL", desc="Used when the last owner writes back and going from M to I") {
+        getDirectoryEntry(address).Head := NULL;
+    }
+
+    action(changeHeadtoNewNext, "hNN", desc="Used after PutSComplete to change head to the new next when head is removed") {
+        peek(complete_in, ResponseMsg) {
+            getDirectoryEntry(address).Head := in_msg.Next;
         }
     }
 
-    action(addOwnerToSharers, "oS", desc="Add the owner to sharers") {
+    // Forwards / invalidations
+
+    action(sendFwdGetS, "fGS", desc="Used when getS in M, send forward getS to owner") {
         Entry e := getDirectoryEntry(address);
-        assert(e.Owner.count() == 1);
-        e.Sharers.addNetDest(e.Owner);
-    }
+        assert(e.Head != NULL);
 
-    action(removeReqFromSharers, "rS", desc="Remove requestor from sharers") {
-        peek(request_in, RequestMsg) {
-            getDirectoryEntry(address).Sharers.remove(in_msg.Requestor);
-        }
-    }
-
-    action(clearSharers, "cS", desc="Clear the sharer list") {
-        getDirectoryEntry(address).Sharers.clear();
-    }
-
-    action(clearOwner, "cO", desc="Clear the owner") {
-        getDirectoryEntry(address).Owner.clear();
-    }
-
-    // Invalidates and forwards
-
-    action(sendInvToSharers, "i", desc="Send invalidate to all sharers") {
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
                 out_msg.addr := address;
-                out_msg.Type := CoherenceRequestType:Inv;
+                out_msg.Type := CoherenceRequestType:FGetS;
                 out_msg.Requestor := in_msg.Requestor;
-                out_msg.Destination := getDirectoryEntry(address).Sharers;
+                out_msg.Destination.add(e.Head);
                 out_msg.MessageSize := MessageSizeType:Control;
             }
         }
     }
 
-    action(sendFwdGetS, "fS", desc="Send forward getS to owner") {
-        assert(getDirectoryEntry(address).Owner.count() == 1);
+    action(sendFwdGetM, "fGM", desc="Used when getM in M, send forward getM to owner") {
+        Entry e := getDirectoryEntry(address);
+        assert(e.Head != NULL);
+
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
                 out_msg.addr := address;
-                out_msg.Type := CoherenceRequestType:GetS;
+                out_msg.Type := CoherenceRequestType:FGetM;
                 out_msg.Requestor := in_msg.Requestor;
-                out_msg.Destination := getDirectoryEntry(address).Owner;
+                out_msg.Destination.add(e.Head);
                 out_msg.MessageSize := MessageSizeType:Control;
             }
         }
     }
 
-    action(sendFwdGetM, "fM", desc="Send forward getM to owner") {
-        assert(getDirectoryEntry(address).Owner.count() == 1);
+    action(sendFwdPutStoHead, "fPS", desc="Used when there is a PutS and the one putting isn't the head (have to traverse the list) or if it is a PutM in S (which we treat as a PutS)") {
+        Entry e := getDirectoryEntry(address);
+        assert(e.Head != NULL);
+
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
                 out_msg.addr := address;
-                out_msg.Type := CoherenceRequestType:GetM;
+                out_msg.Type := CoherenceRequestType:FPutS;
                 out_msg.Requestor := in_msg.Requestor;
-                out_msg.Destination := getDirectoryEntry(address).Owner;
+                out_msg.Destination.add(e.Head);
                 out_msg.MessageSize := MessageSizeType:Control;
             }
         }
     }
 
-    // Responses to requests
+    action(sendInvToSharers, "inv", desc="Used in a getM in S") {
+        Entry e := getDirectoryEntry(address);
+        assert(e.Head != NULL);
 
-    // This also needs to send along the number of sharers!!!!
-    action(sendDataToReq, "d", desc="Send data from memory to requestor. ") {
-                                    //"May need to send sharer number, too") {
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:Invalidation;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination.add(e.Head);
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    // Responses
+
+    action(sendGetSAck, "gS", desc="Send value of current head (read off of directory), send value of data, and change current head to requestor") {
+        peek(memQueue_in, MemoryMsg) {
+            Entry e := getDirectoryEntry(address);
+
+            enqueue(response_out, ResponseMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceResponseType:GetSAck;
+                out_msg.Sender := machineID;
+                out_msg.Destination.add(in_msg.Sender);
+                out_msg.DataBlk := in_msg.DataBlk;
+                out_msg.MessageSize := MessageSizeType:Data;
+
+                out_msg.Next := e.Head;  // old head
+            }
+
+            e.Head := in_msg.Sender; // update head to requestor
+        }
+    } // getSAck: send the value that it should set as next head (add to beginning of list) and data; also change current head to be requestor
+
+    action(sendGetMAck, "gM", desc="Used after getM in I and then it will go to M_m and then get the data") {
         peek(memQueue_in, MemoryMsg) {
             enqueue(response_out, ResponseMsg, 1) {
                 out_msg.addr := address;
-                out_msg.Type := CoherenceResponseType:Data;
+                out_msg.Type := CoherenceResponseType:GetMAck;
                 out_msg.Sender := machineID;
-                out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+                out_msg.Destination.add(in_msg.Sender);
                 out_msg.DataBlk := in_msg.DataBlk;
                 out_msg.MessageSize := MessageSizeType:Data;
-                Entry e := getDirectoryEntry(address);
-                // Only need to include acks if we are the owner.
-                if (e.Owner.isElement(in_msg.OriginalRequestorMachId)) {
-                    out_msg.Acks := e.Sharers.count();
-                } else {
-                    out_msg.Acks := 0;
-                }
-                assert(out_msg.Acks >= 0);
+
+                out_msg.Next := NULL;
             }
         }
     }
 
-    action(sendPutAck, "a", desc="Send the put ack") {
+    action(sendPutIAck, "pIA", desc="Eviction acknowledged but directory thought you were in I") {
         peek(request_in, RequestMsg) {
-            enqueue(forward_out, RequestMsg, 1) {
+            enqueue(response_out, ResponseMsg, 1) {
                 out_msg.addr := address;
-                out_msg.Type := CoherenceRequestType:PutAck;
-                out_msg.Requestor := machineID;
+                out_msg.Type := CoherenceResponseType:PutIAck;
+                out_msg.Sender := machineID;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    action(sendPutSAcktoHead, "pSAH", desc="Used when toEvict is head to trigger toEvict to send a putSComplete back to the directory") {
+        peek(request_in, RequestMsg) {
+            enqueue(response_out, ResponseMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceResponseType:PutSAck;
+                out_msg.Sender := in_msg.Requestor;
+                out_msg.Destination.add(in_msg.Requestor); // same thing as entry.head
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    action(sendPutMAck, "pMA", desc="Evicted owner acknowledgement") {
+        peek(request_in, RequestMsg) {
+            enqueue(response_out, ResponseMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceResponseType:PutMAck;
+                out_msg.Sender := machineID;
                 out_msg.Destination.add(in_msg.Requestor);
                 out_msg.MessageSize := MessageSizeType:Control;
             }
@@ -460,78 +530,104 @@ machine(MachineType:Directory, "Directory protocol")
     /*************************************************************************/
     // transitions
 
-    transition({I, S}, GetS, S_m) {
+    transition(I, GetS, S_m) {
         sendMemRead;
-        addReqToSharers;
         popRequestQueue;
     }
 
-    transition(I, {PutSNotLast, PutSLast, PutMNonOwner}) {
-        sendPutAck;
-        popRequestQueue;
-    }
-
-    transition(S_m, MemData, S) {
-        sendDataToReq;
-        popMemQueue;
-    }
-
-    transition(I, GetM, M_m) {
+    transition(S, GetS, S_m) {
         sendMemRead;
-        setOwner;
-        popRequestQueue;
-    }
-
-    transition(M_m, MemData, M) {
-        sendDataToReq;
-        clearSharers; // NOTE: This isn't *required* in some cases.
-        popMemQueue;
-    }
-
-    transition(S, GetM, M_m) {
-        sendMemRead;
-        removeReqFromSharers;
-        sendInvToSharers;
-        setOwner;
-        popRequestQueue;
-    }
-
-    transition({S, S_D, SS_m, S_m}, {PutSNotLast, PutMNonOwner}) {
-        removeReqFromSharers;
-        sendPutAck;
-        popRequestQueue;
-    }
-
-    transition(S, PutSLast, I) {
-        removeReqFromSharers;
-        sendPutAck;
         popRequestQueue;
     }
 
     transition(M, GetS, S_D) {
         sendFwdGetS;
-        addReqToSharers;
-        addOwnerToSharers;
-        clearOwner;
         popRequestQueue;
     }
 
-    transition(M, GetM) {
+    transition({S_D, SS_ED}, GetS) {
+        stall;
+    }
+
+    transition(S_m, MemData, S) {
+        sendGetSAck; // getSAck with next = old head
+        popMemQueue;
+    }
+
+    transition(I, GetM, M_m) {
+        sendMemRead;
+        popRequestQueue;
+    }
+
+    transition(S, GetM, M) {
+        sendInvToSharers;
+        setHeadtoReq;
+        popRequestQueue;
+    }
+
+    transition(M, GetM, M) {
         sendFwdGetM;
-        clearOwner;
-        setOwner;
+        setHeadtoReq;
         popRequestQueue;
     }
 
-    transition({M, M_m, MI_m}, {PutSNotLast, PutSLast, PutMNonOwner}) {
-        sendPutAck;
+    transition({S_D, SS_ED}, GetM) {
+        stall;
+    }
+
+    transition(M_m, MemData, M) {
+        sendGetMAck; // getMack next = null
+        popMemQueue;
+    }
+
+    transition(I, PutSNotHead, I) {
+        sendPutIAck;
+        popRequestQueue;
+    }
+
+    transition(S, PutSHead, SS_ED) {
+        sendPutSAcktoHead;
+        popRequestQueue;
+    }
+
+    transition(S, PutSNotHead, S) {
+        sendFwdPutStoHead;
+        popRequestQueue;
+    }
+
+    transition(M, PutSNotHead, M) {
+        sendPutIAck;
+        popRequestQueue;
+    }
+
+    transition({S_D, SS_ED}, {PutSHead, PutSNotHead}) {
+        stall;
+    }
+
+    transition(I, PutMNonOwner, I) {
+        sendPutIAck;
+        popRequestQueue;
+    }
+
+    transition(S, PutMOwner, SS_ED) {
+        sendPutSAcktoHead;
+        popRequestQueue;
+    }
+
+    transition(S, PutMNonOwner, S) {
+        sendFwdPutStoHead;
         popRequestQueue;
     }
 
     transition(M, PutMOwner, MI_m) {
         sendDataToMem;
-        clearOwner;
-        sendPutAck;
+        setHeadtoNull;
+        sendPutMAck;
+        popRequestQueue;
+    }
+
+    transition(M, PutMNonOwner, M) {
+        sendPutIAck;
         popRequestQueue;
     }
 
@@ -539,14 +635,8 @@ machine(MachineType:Directory, "Directory protocol")
         popMemQueue;
     }
 
-    transition(S_D, {GetS, GetM}) {
+    transition({S_D, SS_ED}, {PutMOwner, PutMNonOwner}) {
         stall;
-    }
-
-    transition(S_D, PutSLast) {
-        removeReqFromSharers;
-        sendPutAck;
-        popRequestQueue;
     }
 
     transition(S_D, Data, SS_m) {
@@ -556,6 +646,24 @@ machine(MachineType:Directory, "Directory protocol")
 
     transition(SS_m, MemAck, S) {
         popMemQueue;
+    }
+
+    transition(SS_ED, Data) {
+        stall;
+    }
+
+    transition(SS_ED, PutSCompleteLast, I) {
+        changeHeadtoNewNext;
+        popResponseQueue;
+    }
+
+    transition(SS_ED, PutSCompleteNotLast, S) {
+        changeHeadtoNewNext;
+        popResponseQueue
+    }
+
+    transition({SS_m, S_m, M_m, MI_m}, {PutSHead, PutSNotHead, PutMNonOwner, PutMOwner, PutSCompleteLast, PutSCompleteNotLast}) {
+        stall;
     }
 
     // If we get another request for a block that's waiting on memory,
