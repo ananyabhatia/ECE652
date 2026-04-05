@@ -62,11 +62,19 @@ machine(MachineType:L1Cache, "MSI_LL cache")
             vnet_type="response";
 
       // Requests *from* the directory for fwds, invs, and put acks.
-      MessageBuffer * forwardFromDir, network="From", virtual_network="1",
+      MessageBuffer * forwardFromDirOrCache, network="From", virtual_network="1",
             vnet_type="forward";
       // Responses *from* directory and other caches for this cache's reqs.
       MessageBuffer * responseFromDirOrSibling, network="From",
             virtual_network="2", vnet_type="response";
+
+      // Completion from the cache to the directory
+      MessageBuffer *completionFromCache, network="From",
+            virtual_network="3", vnet_type="completion";
+
+      // Completion to a different cache
+      MessageBuffer *completionToCache, network="To",
+            virtual_network="3", vnet_type="completion";
 
       // This is all of the incoming requests from the core via the sequencer
       MessageBuffer * mandatoryQueue;
@@ -87,19 +95,15 @@ machine(MachineType:L1Cache, "MSI_LL cache")
         // States moving out of I
         IS_D,   AccessPermission:Invalid,
                     desc="Invalid, moving to S, waiting for data";
-        IM_AD,  AccessPermission:Invalid,
-                    desc="Invalid, moving to M, waiting for acks and data";
-        IM_A,   AccessPermission:Busy,
-                    desc="Invalid, moving to M, waiting for acks";
+        IM_D,  AccessPermission:Invalid,
+                    desc="Invalid, moving to M, waiting for ack and data (will be in same message)";
 
         S,      AccessPermission:Read_Only,
                     desc="Shared. Read-only, other caches may have the block";
 
         // States moving out of S
-        SM_AD,  AccessPermission:Read_Only,
-                    desc="Shared, moving to M, waiting for acks and 'data'";
-        SM_A,   AccessPermission:Read_Only,
-                    desc="Shared, moving to M, waiting for acks";
+        SM_D,  AccessPermission:Read_Only,
+                    desc="Shared, moving to M, waiting for acks and 'data' (will be in same message)";
 
         M,      AccessPermission:Read_Write,
                     desc="Modified. Read & write permissions. Owner of block";
@@ -112,6 +116,12 @@ machine(MachineType:L1Cache, "MSI_LL cache")
         II_A,   AccessPermission:Invalid,
                     desc="Sent valid data before receiving put ack. ";
                          //"Waiting for put ack.";
+        SS_E,   AccessPermission:Invalid,
+                    desc="Next is evicting, waiting for PutSComplete with newnext";
+        SM_DE,  AccessPermission:Invalid,
+                    desc="Was in SM_D, next is evicting, waiting for PutSComplete with newnext";
+        SI_AE,  AccessPermission:Invalid,
+                    desc="Was in SI_A, next is evicting, waiting for PutSComplete with newnext";
     }
 
     // Events that can be triggered on incoming messages. These are the events
@@ -121,6 +131,9 @@ machine(MachineType:L1Cache, "MSI_LL cache")
         Load,           desc="Load from processor";
         Store,          desc="Store from processor";
 
+        GetSAck,        desc="Response from either directory or other cache with data";
+        GetMAck,        desc="Response either directory or other cache with data";
+
         // Internal event (only triggered from processor requests)
         Replacement,    desc="Triggered when block is chosen as victim";
 
@@ -129,21 +142,24 @@ machine(MachineType:L1Cache, "MSI_LL cache")
                              //"We must have the block in M to respond to this.";
         FwdGetM,        desc="Directory sent us a request to satisfy GetM. ";
                              //"We must have the block in M to respond to this.";
-        Inv,            desc="Invalidate from the directory.";
-        PutAck,         desc="Response from directory after we issue a put. ";
+        FwdPutSNextToEvict,        desc="Going through linked list trying to find the block to evict. Your next is the block to evict";
+        FwdPutSNextNotToEvict,     desc="Going through linked list trying to find the block to evict. Your next is not the block to evict and is not null, pass it on";
+        FwdPutSNextNull,            desc="Going through linked list trying to find the block to evict. Your next is null which means we didnt find it so we should send a putIAck to Req";
+
+        InvSelfNextNull,        desc="Invalidate from prev node. Original requestor (trying to go to M) is self";
+        InvOtherNextNull,       desc="Invalidate from prev node. Original requestor (trying to go to M) is other cache";
+        InvSelfNextNotNull,        desc="Invalidate from prev node. Original requestor (trying to go to M) is self";
+        InvOtherNextNotNull,       desc="Invalidate from prev node. Original requestor (trying to go to M) is other cache";
+
+        PutMAck,         desc="Response from directory after we issue a putM. Does not have next ptr since it was a PutM";
                              //"This must be on the fwd network to avoid";
                              //"deadlock.";
+        PutSAck,        desc="Response from directory or cache that you are the block to evict and you should send a PutSComplete";
 
-        // Responses from directory
-        DataDirNoAcks,  desc="Data from directory (acks = 0)";
-        DataDirAcks,    desc="Data from directory (acks > 0)";
+        PutIAck,        desc="Response from directory that it got your put and thought you were in I when you sent it";
 
-        // Responses from other caches
-        DataOwner,      desc="Data from owner";
-        InvAck,         desc="Invalidation ack from other cache after Inv";
+        PutSComplete,   desc="Response from other cache telling you what your newNext should be";
 
-        // Special internally triggered event to simplify implementation
-        LastInvAck,     desc="Triggered after the last ack is received";
     }
 
     // A structure for the cache entry. This stores the cache data and state
@@ -155,6 +171,7 @@ machine(MachineType:L1Cache, "MSI_LL cache")
     structure(Entry, desc="Cache entry", interface="AbstractCacheEntry") {
         State CacheState,        desc="cache state";
         DataBlock DataBlk,       desc="Data in the block";
+        MachineID Next,          desc="Next pointer in sharer list";
     }
 
     // TBE is the "transaction buffer entry". This stores information needed
@@ -304,6 +321,7 @@ machine(MachineType:L1Cache, "MSI_LL cache")
     //      we are sending these requests out of.
     out_port(request_out, RequestMsg, requestToDir);
     out_port(response_out, ResponseMsg, responseToDirOrSibling);
+    out_port(completion_out, ResponseMsg, completionToCache);
 
     // Input ports. The order here is/(can be) important. The code in each
     // in_port is executed in the order specified in this file (or by the rank
@@ -328,77 +346,83 @@ machine(MachineType:L1Cache, "MSI_LL cache")
             peek(response_in, ResponseMsg) {
                 // Grab the entry and tbe if they exist.
                 Entry cache_entry := getCacheEntry(in_msg.addr);
-                TBE tbe := TBEs[in_msg.addr];
+                // TODO: do i need a tbe? i dont think so?
                 // The TBE better exist since this is a response and we need to
                 // be able to check the remaining acks.
-                assert(is_valid(tbe));
+                // TBE tbe := TBEs[in_msg.addr];
+                // assert(is_valid(tbe));
 
-                // If it's from the directory...
-                if (machineIDToMachineType(in_msg.Sender) ==
-                            MachineType:Directory) {
-                    if (in_msg.Type != CoherenceResponseType:Data) {
-                        error("Directory should only reply with data");
-                    }
-                    // Take the in_msg acks and add (sub) the Acks we've seen.
-                    // The InvAck will decrement the acks we're waiting for in
-                    // tbe.AcksOutstanding to below 0 if we haven't gotten the
-                    // dir resp yet. So, if this is 0 we don't need to wait
-                    assert(in_msg.Acks + tbe.AcksOutstanding >= 0);
-                    if (in_msg.Acks + tbe.AcksOutstanding == 0) {
-                        trigger(Event:DataDirNoAcks, in_msg.addr, cache_entry,
-                                tbe);
-                    } else {
-                        // If it's not 0, then we need to wait for more acks
-                        // and we'll trigger LastInvAck later.
-                        trigger(Event:DataDirAcks, in_msg.addr, cache_entry,
-                                tbe);
-                    }
+                if (in_msg.Type == CoherenceResponseType:GetSAck) {
+                    trigger(Event:GetSAck, in_msg.addr);
+                } else if (in_msg.Type == CoherenceResponseType:GetMAck) {
+                    trigger(Event:GetMAck, in_msg.addr);
+                } else if (in_msg.Type == CoherenceResponseType:PutIAck) {
+                    trigger(Event:PutIAck, in_msg.addr);
+                } else if (in_msg.Type == CoherenceResponseType:PutSAck) {
+                    trigger(Event:PutSAck, in_msg.addr);
+                } else if (in_msg.Type == CoherenceResponseType:PutMAck) {
+                    trigger(Event:PutMAck, in_msg.addr);
                 } else {
-                    // This is from another cache.
-                    if (in_msg.Type == CoherenceResponseType:Data) {
-                        trigger(Event:DataOwner, in_msg.addr, cache_entry,
-                                tbe);
-                    } else if (in_msg.Type == CoherenceResponseType:InvAck) {
-                        DPRINTF(RubySlicc, "Got inv ack. %d left\n",
-                                tbe.AcksOutstanding);
-                        if (tbe.AcksOutstanding == 1) {
-                            // If there is exactly one ack remaining then we
-                            // know it is the last ack.
-                            trigger(Event:LastInvAck, in_msg.addr, cache_entry,
-                                    tbe);
-                        } else {
-                            trigger(Event:InvAck, in_msg.addr, cache_entry,
-                                    tbe);
-                        }
-                    } else {
-                        error("Unexpected response from other cache");
-                    }
+                    error("Invalid message");
                 }
             }
         }
     }
 
     // Forward requests for other caches.
-    in_port(forward_in, RequestMsg, forwardFromDir) {
+    in_port(forward_in, RequestMsg, forwardFromDirOrCache) {
         if (forward_in.isReady(clockEdge())) {
             peek(forward_in, RequestMsg) {
                 // Grab the entry and tbe if they exist.
                 Entry cache_entry := getCacheEntry(in_msg.addr);
-                TBE tbe := TBEs[in_msg.addr];
 
-                if (in_msg.Type == CoherenceRequestType:GetS) {
-                    // This is a special function that will trigger a
-                    // transition (as defined below). It *must* have these
-                    // parameters.
-                    trigger(Event:FwdGetS, in_msg.addr, cache_entry, tbe);
-                } else if (in_msg.Type == CoherenceRequestType:GetM) {
-                    trigger(Event:FwdGetM, in_msg.addr, cache_entry, tbe);
-                } else if (in_msg.Type == CoherenceRequestType:Inv) {
-                    trigger(Event:Inv, in_msg.addr, cache_entry, tbe);
-                } else if (in_msg.Type == CoherenceRequestType:PutAck) {
-                    trigger(Event:PutAck, in_msg.addr, cache_entry, tbe);
+                if (in_msg.Type == CoherenceRequestType:Invalidation) {
+                    if (in_msg.Requestor == machineID) {
+                        if (!is_valid(cache_entry.Next)) {
+                            trigger(Event:InvSelfNextNull, in_msg.addr);
+                        }
+                        else {
+                            trigger(Event:InvSelfNextNotNull, in_msg.addr)
+                        }
+                    }
+                    else {
+                        if (!is_valid(cache_entry.Next)) {
+                            trigger(Event:InvOtherNextNull, in_msg.addr);
+                        }
+                        else {
+                            trigger(Event:InvOtherNextNotNull, in_msg.addr)
+                        }
+                    }
+                } else if (in_msg.Type == CoherenceRequestType:FGetS) {
+                    trigger(Event:FwdGetS, in_msg.addr);
+                } else if (in_msg.Type == CoherenceRequestType:FGetM) {
+                    trigger(Event:FwdGetM, in_msg.addr);
+                } else if (in_msg.Type == CoherenceRequestType:FPutS) {
+                    if (cache_entry.Next == in_msg.Requestor) {
+                        trigger(Event:FwdPutSNextToEvict, in_msg.addr);
+                    }
+                    else if (!is_valid(cache_entry.Next)) {
+                        trigger(Event:FwdPutSNextNull, in_msg.addr);
+                    }
+                    else {
+                        trigger(Event:FwdPutSNextNotToEvict, in_msg.addr);
+                    }
                 } else {
                     error("Unexpected forward message!");
+                }
+            }
+        }
+    }
+
+    in_port(complete_in, ResponseMsg, completionFromCache) {
+        if (complete_in.isReady(clockEdge())) {
+            peek(complete_in, ResponseMsg) {
+                Entry entry := getDirectoryEntry(in_msg.addr);
+                if (in_msg.Type == CoherenceResponseType:PutSCompleteCache) {
+                    trigger(Event:PutSComplete, in_msg.addr);
+                }
+                else {
+                    error("Unexpected message type.");
                 }
             }
         }
@@ -649,20 +673,6 @@ machine(MachineType:L1Cache, "MSI_LL cache")
         }
     }
 
-    action(allocateTBE, "aT", desc="Allocate TBE") {
-        assert(is_invalid(tbe));
-        TBEs.allocate(address);
-        // this updates the tbe variable for other actions
-        set_tbe(TBEs[address]);
-    }
-
-    action(deallocateTBE, "dT", desc="Deallocate TBE") {
-        assert(is_valid(tbe));
-        TBEs.deallocate(address);
-        // this makes the tbe varible invalid
-        unset_tbe();
-    }
-
     // Queue management actions
 
     action(popMandatoryQueue, "pQ", desc="Pop the mandatory queue") {
@@ -675,6 +685,10 @@ machine(MachineType:L1Cache, "MSI_LL cache")
 
     action(popForwardQueue, "pF", desc="Pop the forward queue") {
         forward_in.dequeue(clockEdge());
+    }
+
+    action(popCompleteQueue, "pC", desc="Pop the complete queue") {
+        complete_in.dequeue(clockEdge());
     }
 
     // Stalling actions
@@ -699,126 +713,152 @@ machine(MachineType:L1Cache, "MSI_LL cache")
     // examples of transition statements.
     // Within the transition statement is a set of action to take during the
     // transition. These actions are executed atomically (i.e., all or nothing)
+
     transition(I, Load, IS_D) {
-        // Make sure there is room in the cache to put the block whenever the
-        // miss returns. Otherwise we could deadlock.
         allocateCacheBlock;
-        // We may need to track acks for this block and only the TBE holds an
-        // ack count. Thus, we need to allocate both a TBE and cache block.
-        allocateTBE;
-        // Actually send the request to the directory
         sendGetS;
-        // Since we have handled this request on the mandatory queue, we can pop
         popMandatoryQueue;
     }
 
-    transition(I, Store, IM_AD) {
+    transition(I, Store, IM_D) {
         allocateCacheBlock;
-        allocateTBE;
         sendGetM;
         popMandatoryQueue;
     }
 
-    // You can use {} to specify multiple states or events for which the
-    // transition applies. For instance, below. If we are in IS_D, then on any
-    // of the following Events (Load, Store, Replacement, Inv) we should stall
-    // When there is no third parameter to transition, it means that we want
-    // to stay in the initial state.
-    transition(IS_D, {Load, Store, Replacement, Inv}) {
+    transition(IS_D, {Load, Store, Replacement, InvSelfNextNull, InvSelfNextNotNull, InvOtherNextNull, InvOtherNextNotNull}) {
         stall;
     }
 
-    // Similarly, on either DataDirNoAcks or DataOwner we should go to S
-    transition(IS_D, {DataDirNoAcks, DataOwner}, S) {
+    transition(IS_D, GetSAck, S) {
         writeDataToCache;
-        deallocateTBE;
-        externalLoadHit;
+        setNextPtr; // going from I->S the getSack may have had a next ptr to link you to the chain
+        externalLoadHit; // tells CPU we have the data now
         popResponseQueue;
     }
 
-    transition({IM_AD, IM_A}, {Load, Store, Replacement, FwdGetS, FwdGetM}) {
+    transition(IM_D, {Load, Store, Replacement, FwdGetS, FwdGetM, InvSelfNextNull, InvSelfNextNotNull, InvOtherNextNull, InvOtherNextNotNull}) {
         stall;
     }
 
-    transition({IM_AD, SM_AD}, {DataDirNoAcks, DataOwner}, M) {
+    transition(IM_D, GetMAck, M) {
         writeDataToCache;
-        deallocateTBE;
+        setNextPtr;
         externalStoreHit;
         popResponseQueue;
     }
 
-    transition(IM_AD, DataDirAcks, IM_A) {
-        writeDataToCache;
-        storeAcks;
-        popResponseQueue;
-    }
-
-    transition({IM_AD, IM_A, SM_AD, SM_A}, InvAck) {
-        decrAcks;
-        popResponseQueue;
-    }
-
-    transition({IM_A, SM_A}, LastInvAck, M) {
-        deallocateTBE;
-        externalStoreHit;
-        popResponseQueue;
-    }
-
-    transition({S, SM_AD, SM_A, M}, Load) {
+    transition({S, SM_D, M}, Load) {
         loadHit;
         popMandatoryQueue;
     }
 
-    transition(S, Store, SM_AD) {
-        allocateTBE;
+    transition(S, Store, SM_D) {
         sendGetM;
         popMandatoryQueue;
     }
 
     transition(S, Replacement, SI_A) {
         sendPutS;
+        popMandatoryQueue;
+        // TODO: pop queue?
     }
 
-    transition(S, Inv, I) {
-        sendInvAcktoReq;
+    transition(S, InvOtherNextNull, I) {
         forwardEviction;
         deallocateCacheBlock;
+        sendGetMAckToReq;
         popForwardQueue;
     }
 
-    transition({SM_AD, SM_A}, {Store, Replacement, FwdGetS, FwdGetM}) {
+    transition(S, InvOtherNextNotNull, I) {
+        forwardEviction;
+        deallocateCacheBlock;
+        sendInvalToNext;
+        popForwardQueue;
+    }
+
+    transition(S, FwdPutSNextToEvict, SS_E) {
+        sendPutSAckToNext;
+        popForwardQueue;
+    }
+
+    transition(S, FwdPutSNextNotToEvict, S) {
+        sendFwdPutSToNext;
+        popForwardQueue;
+    }
+
+    transition(S, FwdPutSNextNull, S) {
+        sendPutIAckToReq;
+        popForwardQueue;
+    }
+
+    transition(SM_D, {Store, Replacement, FwdGetS, FwdGetM}) {
         stall;
     }
 
-    transition(SM_AD, Inv, IM_AD) {
-        sendInvAcktoReq;
+    transition(SM_D, InvSelfNextNull, M) {
+        writeDataToCache;
+        setNextPtr;
+        externalStoreHit;
         popForwardQueue;
     }
 
-    transition(SM_AD, DataDirAcks, SM_A) {
-        writeDataToCache;
-        storeAcks;
-        popResponseQueue;
+    transition(SM_D, InvSelfNextNotNull, SM_D) {
+        sendInvalToNext;
+        popForwardQueue;
+    }
+
+    transition(SM_D, InvOtherNextNull, IM_D) {
+        forwardEviction;
+        deallocateCacheBlock;
+        sendGetMAckToReq;
+        popForwardQueue;
+    }
+
+    transition(SM_D, InvOtherNextNotNull, IM_D) {
+        forwardEviction;
+        deallocateCacheBlock;
+        sendInvalToNext;
+        popForwardQueue;
+    }
+
+    transition(SM_D, FwdPutSNextToEvict, SS_DE) {
+        sendPutSAckToNext;
+        popForwardQueue;
+    }
+
+    transition(SM_D, FwdPutSNextNotToEvict, SM_D) {
+        sendFwdPutSToNext;
+        popForwardQueue;
+    }
+
+    transition(SM_D, FwdPutSNextNull, SM_D) {
+        sendPutIAckToReq;
+        popForwardQueue;
     }
 
     transition(M, Store) {
         storeHit;
-        forwardEviction;
+        // forwardEviction; // TODO: ask about this
         popMandatoryQueue;
     }
 
     transition(M, Replacement, MI_A) {
         sendPutM;
+        popMandatoryQueue;
+        // TODO: pop queue?
     }
 
     transition(M, FwdGetS, S) {
-        sendCacheDataToReq;
+        sendGetSAck;
+        setNextAsReq;
         sendCacheDataToDir;
         popForwardQueue;
     }
 
     transition(M, FwdGetM, I) {
-        sendCacheDataToReq;
+        sendGetMAck;
         deallocateCacheBlock;
         popForwardQueue;
     }
@@ -827,25 +867,101 @@ machine(MachineType:L1Cache, "MSI_LL cache")
         stall;
     }
 
+    transition(SI_A, InvOtherNextNull, II_A) {
+        forwardEviction;
+        sendGetMAckToReq;
+        popForwardQueue;
+    }
+
+    transition(SI_A, InvOtherNextNotNull, II_A) {
+        forwardEviction;
+        sendInvalToNext;
+        popForwardQueue;
+    }
+
+    transition(SI_A, FwdPutSNextToEvict, SI_AE) {
+        sendPutSAckToNext;
+        popForwardQueue;
+    }
+
+    transition(SI_A, FwdPutSNextNotToEvict, SI_A) {
+        sendFwdPutSToNext;
+        popForwardQueue;
+    }
+
+    transition(SI_A, FwdPutSNextNull, SI_A) {
+        sendPutIAckToReq;
+        popForwardQueue;
+    }
+
+    transition(SI_A, PutSAck, I) {
+        deallocateCacheBlock;
+        // TODO: do i need to forwardeviction here?
+        sendPutSComplete;
+        popResponseQueue;
+    }
+
+    transition(SI_A, PutIAck) {
+        stall;
+    }
+
     transition(MI_A, FwdGetS, SI_A) {
-        sendCacheDataToReq;
+        sendGetSAck;
+        setNextAsReq;
         sendCacheDataToDir;
         popForwardQueue;
     }
 
     transition(MI_A, FwdGetM, II_A) {
-        sendCacheDataToReq;
+        sendGetMAck;
         popForwardQueue;
     }
 
-    transition({MI_A, SI_A, II_A}, PutAck, I) {
+    transition(MI_A, {PutSAck, PutIAck}) {
+        stall; // TODO: convince self this doesn't deadlock
+    }
+
+    transition(MI_A, PutMAck, I) {
         deallocateCacheBlock;
         popForwardQueue;
     }
 
-    transition(SI_A, Inv, II_A) {
-        sendInvAcktoReq;
-        popForwardQueue;
+    transition(II_A, PutSAck, I) {
+        sendPutSComplete;
+        popResponseQueue;
     }
+
+    transition(II_A, PutIAck, PutMAck, I) {
+        deallocateCacheBlock;
+        popResponseQueue;
+    }
+
+    transition(SS_E, {Load, Store, GetSAck, GetMAck, Replacement, FwdGetS, FwdGetM, FwdPutSNextToEvict, FwdPutSNextNotToEvict, FwdPutSNextNull, InvSelfNextNull, InvSelfNextNotNull, InvOtherNextNull, InvOtherNextNotNull, PutMAck, PutSAck, PutIAck}) {
+        stall;
+    }
+
+    transition(SM_DE, {Load, Store, GetSAck, GetMAck, Replacement, FwdGetS, FwdGetM, FwdPutSNextToEvict, FwdPutSNextNotToEvict, FwdPutSNextNull, InvSelfNextNull, InvSelfNextNotNull, InvOtherNextNull, InvOtherNextNotNull, PutMAck, PutSAck, PutIAck}) {
+        stall;
+    }
+
+    transition(SI_AE, {Load, Store, GetSAck, GetMAck, Replacement, FwdGetS, FwdGetM, FwdPutSNextToEvict, FwdPutSNextNotToEvict, FwdPutSNextNull, InvSelfNextNull, InvSelfNextNotNull, InvOtherNextNull, InvOtherNextNotNull, PutMAck, PutSAck, PutIAck}) {
+        stall;
+    }
+
+    transition(SS_E, PutSComplete, S) {
+        setNextPtr;
+        popCompleteQueue;
+    }
+
+    transition(SM_DE, PutSComplete, SM_D) {
+        setNextPtr;
+        popCompleteQueue;
+    }
+
+    transition(SI_A, PutSComplete, SI_A) {
+        setNextPtr;
+        popCompleteQueue;
+    }
+
 
 }

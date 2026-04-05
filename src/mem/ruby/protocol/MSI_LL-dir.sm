@@ -289,7 +289,7 @@ machine(MachineType:Directory, "Directory protocol")
             peek(complete_in, ResponseMsg) {
                 Entry entry := getDirectoryEntry(in_msg.addr);
                 if (in_msg.Type == CoherenceResponseType:PutSCompleteDir) {
-                    if (in_msg.Next == NULL) {
+                    if (!is_valid(in_msg.Next)) {
                         trigger(Event:PutSCompleteLast, in_msg.addr);
                     }
                     else {
@@ -364,7 +364,7 @@ machine(MachineType:Directory, "Directory protocol")
     }
 
     action(setHeadtoNull, "hNULL", desc="Used when the last owner writes back and going from M to I") {
-        getDirectoryEntry(address).Head := NULL;
+        getDirectoryEntry(address).Head := MachineID(); // null
     }
 
     action(changeHeadtoNewNext, "hNN", desc="Used after PutSComplete to change head to the new next when head is removed") {
@@ -377,7 +377,7 @@ machine(MachineType:Directory, "Directory protocol")
 
     action(sendFwdGetS, "fGS", desc="Used when getS in M, send forward getS to owner") {
         Entry e := getDirectoryEntry(address);
-        assert(e.Head != NULL);
+        assert(is_valid(e.Head));
 
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
@@ -392,7 +392,7 @@ machine(MachineType:Directory, "Directory protocol")
 
     action(sendFwdGetM, "fGM", desc="Used when getM in M, send forward getM to owner") {
         Entry e := getDirectoryEntry(address);
-        assert(e.Head != NULL);
+        assert(is_valid(e.Head));
 
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
@@ -407,7 +407,7 @@ machine(MachineType:Directory, "Directory protocol")
 
     action(sendFwdPutStoHead, "fPS", desc="Used when there is a PutS and the one putting isn't the head (have to traverse the list) or if it is a PutM in S (which we treat as a PutS)") {
         Entry e := getDirectoryEntry(address);
-        assert(e.Head != NULL);
+        assert(is_valid(e.Head));
 
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
@@ -422,7 +422,7 @@ machine(MachineType:Directory, "Directory protocol")
 
     action(sendInvToSharers, "inv", desc="Used in a getM in S") {
         Entry e := getDirectoryEntry(address);
-        assert(e.Head != NULL);
+        assert(is_valid(e.Head));
 
         peek(request_in, RequestMsg) {
             enqueue(forward_out, RequestMsg, 1) {
@@ -466,7 +466,7 @@ machine(MachineType:Directory, "Directory protocol")
                 out_msg.DataBlk := in_msg.DataBlk;
                 out_msg.MessageSize := MessageSizeType:Data;
 
-                out_msg.Next := NULL;
+                out_msg.Next := MachineID(); // same as null
             }
         }
     }
@@ -519,6 +519,10 @@ machine(MachineType:Directory, "Directory protocol")
 
     action(popMemQueue, "pM", desc="Pop the memory queue") {
         dequeueMemRespQueue();
+    }
+
+    action(popCompleteQueue, "pC", desc="Pop the complete queue") {
+        complete_in.dequeue(clockEdge());
     }
 
     // Stalling actions
@@ -654,12 +658,12 @@ machine(MachineType:Directory, "Directory protocol")
 
     transition(SS_ED, PutSCompleteLast, I) {
         changeHeadtoNewNext;
-        popResponseQueue;
+        popCompleteQueue;
     }
 
     transition(SS_ED, PutSCompleteNotLast, S) {
         changeHeadtoNewNext;
-        popResponseQueue
+        popCompleteQueue;
     }
 
     transition({SS_m, S_m, M_m, MI_m}, {PutSHead, PutSNotHead, PutMNonOwner, PutMOwner, PutSCompleteLast, PutSCompleteNotLast}) {
